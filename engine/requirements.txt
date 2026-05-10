@@ -1,4 +1,8 @@
-torch
+# torch is pinned because mamba-ssm builds an ABI-locked .so. If torch
+# upgrades after build, the kernel import fails with undefined-symbol
+# (`c10::cuda::c10_cuda_check_implementation`). Match the version on your
+# host (RunPod PyTorch templates currently ship 2.8.0+cu128).
+torch==2.8.0
 transformers
 outlines
 psycopg2-binary
