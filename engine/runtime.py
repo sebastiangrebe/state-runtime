@@ -169,19 +169,44 @@ class HybridRuntime:
     # ------------------------------------------------------------------
 
     def _generate_xgrammar(self, prompt: str, compiled_grammar, budget: int) -> str:
+        import xgrammar as xgr  # type: ignore
+
         ids = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
-        from xgrammar.contrib.hf import LogitsProcessor as XgrLogitsProcessor  # type: ignore
-        proc = XgrLogitsProcessor(compiled_grammar)
+        prompt_len = int(ids["input_ids"].shape[-1])
+        vocab_size = int(self.model.config.vocab_size)
+
+        matcher = xgr.GrammarMatcher(compiled_grammar)
+        bitmask = xgr.allocate_token_bitmask(1, vocab_size)
+        # Wrap state so the closure can mutate (no nonlocal in nested fn here).
+        state = {"first": True, "done": False}
+
+        def processor(input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
+            # Accept the previously-sampled token (the one just appended to input_ids).
+            if state["first"]:
+                state["first"] = False
+            elif not state["done"]:
+                last_tok = int(input_ids[0, -1].item())
+                if not matcher.accept_token(last_tok):
+                    state["done"] = True
+
+            if state["done"] or matcher.is_terminated():
+                state["done"] = True
+                return scores
+
+            matcher.fill_next_token_bitmask(bitmask)
+            xgr.apply_token_bitmask_inplace(scores, bitmask.to(scores.device))
+            return scores
+
         with torch.no_grad():
             out = self.model.generate(
                 **ids,
                 max_new_tokens=budget,
                 do_sample=False,
                 use_cache=True,
-                logits_processor=LogitsProcessorList([proc]),
+                logits_processor=LogitsProcessorList([processor]),
                 pad_token_id=self.tokenizer.eos_token_id,
             )
-        new_tokens = out[0, ids["input_ids"].shape[-1]:]
+        new_tokens = out[0, prompt_len:]
         return self.tokenizer.decode(new_tokens, skip_special_tokens=True)
 
     # ------------------------------------------------------------------
