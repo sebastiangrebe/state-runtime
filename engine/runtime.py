@@ -53,6 +53,8 @@ Boot/USER_COMMAND → emit a UIStateManifest.
 Click → emit DatabaseAction (SQL UPDATE/INSERT/DELETE on `alerts` only).
 After SQL_RESULT → emit UIPatch with RFC6902 ops against the last manifest you emitted (e.g. {"op":"replace","path":"/components/0/rows/1/status","value":"resolved"}). Prefer a single small patch.
 
+IMPORTANT: in patch paths, the integer between /rows/ and /status is the ARRAY INDEX (zero-based) of the row, not the alert's `id`. The ROWS_INDEX line in the event stream maps array indices to alert ids — read it before emitting a patch.
+
 Always echo DB_STATE accurately. Never invent rows.
 """
 

@@ -143,6 +143,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
 
         db_state = list_alerts()
         await trace("DB_STATE_BEFORE", db_state)
+        index_hint = "ROWS_INDEX: " + ", ".join(f"rows.{i}=id{r['id']}" for i, r in enumerate(db_state))
 
         is_command = bool(incoming) and incoming.get("event") == "USER_COMMAND"
 
@@ -156,6 +157,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
             await trace("USER_ACTION", incoming)
             context.append(f"USER_ACTION: {json.dumps(incoming)}")
         context.append(f"DB_STATE: {json.dumps(db_state)}")
+        context.append(index_hint)
 
         # Boot + USER_COMMAND → full manifest. No prior state to patch (boot)
         # or whole-screen replace intended (command).
@@ -182,6 +184,8 @@ async def ws_endpoint(ws: WebSocket) -> None:
         new_state = list_alerts()
         await trace("DB_STATE_AFTER", new_state)
         context.append(f"DB_STATE: {json.dumps(new_state)}")
+        new_index = "ROWS_INDEX: " + ", ".join(f"rows.{i}=id{r['id']}" for i, r in enumerate(new_state))
+        context.append(new_index)
 
         await trace("MODEL_INPUT", {"target": "UIPatch (forced after SQL)", "events_tail": context[-12:]})
         patch = await gen(UIPatch, max_new_tokens=128)
