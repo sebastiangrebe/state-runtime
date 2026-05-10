@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import pathlib
+import re
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -28,9 +29,40 @@ from .runtime import HybridRuntime
 from .schemas import (
     DatabaseAction,
     EngineOutputEnvelope,
+    PatchOp,
     UIPatch,
     UIStateManifest,
 )
+
+
+# Cheap deterministic patch builder. The model already decided WHICH alert to
+# mutate (it emitted the SQL); reflecting that on the canonical manifest is
+# mechanical, so we skip a second model call (~0.6 s saved per click).
+_SQL_UPDATE = re.compile(
+    r"UPDATE\s+alerts\s+SET\s+status\s*=\s*'(?P<value>[^']+)'\s+WHERE\s+id\s*=\s*(?P<id>\d+)",
+    re.IGNORECASE,
+)
+
+
+def patch_from_sql(sql: str, manifest: UIStateManifest) -> UIPatch | None:
+    m = _SQL_UPDATE.search(sql.strip().rstrip(";"))
+    if not m:
+        return None
+    target_id = int(m.group("id"))
+    new_value = m.group("value")
+    for ci, comp in enumerate(manifest.components):
+        rows = getattr(comp, "rows", None)
+        if not rows:
+            continue
+        for ri, row in enumerate(rows):
+            if getattr(row, "id", None) == target_id:
+                return UIPatch(
+                    kind="patch",
+                    ops=[PatchOp(op="replace",
+                                 path=f"/components/{ci}/rows/{ri}/status",
+                                 value=new_value)],
+                )
+    return None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("hybrid.engine")
@@ -187,9 +219,18 @@ async def ws_endpoint(ws: WebSocket) -> None:
         new_index = "ROWS_INDEX: " + ", ".join(f"rows.{i}=id{r['id']}" for i, r in enumerate(new_state))
         context.append(new_index)
 
-        await trace("MODEL_INPUT", {"target": "UIPatch (forced after SQL)", "events_tail": context[-12:]})
-        patch = await gen(UIPatch, max_new_tokens=128)
-        await trace("MODEL_OUTPUT_FINAL", patch.model_dump())  # type: ignore[union-attr]
+        # Skip a second model call — derive the patch from the SQL we already
+        # ran. The model decided WHICH row to mutate (in the SQL); reflecting
+        # that on the canonical manifest is bookkeeping, not a decision.
+        patch = patch_from_sql(action.sql, current_manifest) if current_manifest else None  # type: ignore[union-attr]
+        if patch is None:
+            # SQL didn't fit the simple mutation pattern → fall back to a
+            # model-generated UIPatch for safety.
+            await trace("MODEL_INPUT", {"target": "UIPatch (fallback)", "events_tail": context[-12:]})
+            patch = await gen(UIPatch, max_new_tokens=128)
+            await trace("MODEL_OUTPUT_FINAL", patch.model_dump())  # type: ignore[union-attr]
+        else:
+            await trace("PATCH_FROM_SQL", patch.model_dump())
         await emit_patch(patch)  # type: ignore[arg-type]
 
     try:
