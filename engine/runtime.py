@@ -17,7 +17,13 @@ import re
 import time
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, LogitsProcessorList
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    LogitsProcessorList,
+    StoppingCriteria,
+    StoppingCriteriaList,
+)
 
 from .schemas import EngineOutputEnvelope, UIPatch, UIStateManifest
 
@@ -177,11 +183,9 @@ class HybridRuntime:
 
         matcher = xgr.GrammarMatcher(compiled_grammar)
         bitmask = xgr.allocate_token_bitmask(1, vocab_size)
-        # Wrap state so the closure can mutate (no nonlocal in nested fn here).
         state = {"first": True, "done": False}
 
         def processor(input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
-            # Accept the previously-sampled token (the one just appended to input_ids).
             if state["first"]:
                 state["first"] = False
             elif not state["done"]:
@@ -197,6 +201,16 @@ class HybridRuntime:
             xgr.apply_token_bitmask_inplace(scores, bitmask.to(scores.device))
             return scores
 
+        class GrammarTerminated(StoppingCriteria):
+            """Stop the moment the JSON FSM reports a complete match.
+
+            Without this, the grammar accepts trailing whitespace forever and
+            decode runs to max_new_tokens — every turn pads with ~100 newlines.
+            """
+
+            def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor, **_) -> bool:  # noqa: D401, ARG002
+                return state["done"] or matcher.is_terminated()
+
         with torch.no_grad():
             out = self.model.generate(
                 **ids,
@@ -204,6 +218,7 @@ class HybridRuntime:
                 do_sample=False,
                 use_cache=True,
                 logits_processor=LogitsProcessorList([processor]),
+                stopping_criteria=StoppingCriteriaList([GrammarTerminated()]),
                 pad_token_id=self.tokenizer.eos_token_id,
             )
         new_tokens = out[0, prompt_len:]
