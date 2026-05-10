@@ -48,9 +48,9 @@ async def lifespan(_: FastAPI):
     runtime = HybridRuntime()
     generation_lock = asyncio.Lock()
 
-    # Warm the outlines FSM cache so the first click doesn't eat the compile.
+    # Warm the constrainer cache so first click doesn't eat schema compile.
     for schema in (UIStateManifest, UIPatch, DatabaseAction):
-        runtime._generator_for(schema)
+        runtime._compile(schema)
 
     log.info("ready device=%s", runtime.device)
     yield

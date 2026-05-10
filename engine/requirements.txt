@@ -5,6 +5,8 @@
 torch==2.8.0
 transformers
 outlines
+xgrammar
+einops
 psycopg2-binary
 fastapi
 uvicorn[standard]

@@ -1,8 +1,11 @@
-"""HybridRuntime — native Jamba2 + outlines.
+"""HybridRuntime — native Jamba2 + xgrammar-constrained decoding.
 
-Strict mode: no stubs, no fallback rendering, no STUB_MODE. If the model or
-constrained decoding fails, the exception propagates so the operator can see
-the real PyTorch / kernel error.
+Two backends:
+  * xgrammar (default, ~0 ms/tok overhead) — used when `xgrammar` is importable.
+  * outlines (fallback) — for hosts without xgrammar wheels.
+
+Strict mode: no stubs, no fallback rendering. If the model or constrained
+decoding fails, the exception propagates so the operator sees the real error.
 """
 
 from __future__ import annotations
@@ -13,18 +16,18 @@ import os
 import re
 import time
 
-import outlines
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, LogitsProcessorList
 
 from .schemas import EngineOutputEnvelope, UIPatch, UIStateManifest
-
-_TRAILING_COMMA = re.compile(r",(\s*[}\]])")
 
 log = logging.getLogger("hybrid.runtime")
 
 MODEL_ID = os.environ.get("MODEL_ID", "ai21labs/AI21-Jamba2-3B")
-MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "768"))
+MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "512"))
+BACKEND = os.environ.get("CONSTRAINER", "xgrammar")  # xgrammar | outlines
+
+_TRAILING_COMMA = re.compile(r",(\s*[}\]])")
 
 
 def _pick_device() -> tuple[str, torch.dtype]:
@@ -51,7 +54,8 @@ Always echo DB_STATE accurately. Never invent rows.
 class HybridRuntime:
     def __init__(self) -> None:
         self.device, self.dtype = _pick_device()
-        log.info("HybridRuntime device=%s dtype=%s model=%s", self.device, self.dtype, MODEL_ID)
+        log.info("HybridRuntime device=%s dtype=%s model=%s backend=%s",
+                 self.device, self.dtype, MODEL_ID, BACKEND)
 
         log.info("loading tokenizer %s", MODEL_ID)
         self.tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
@@ -65,21 +69,56 @@ class HybridRuntime:
             self.model = self.model.to(self.device)
         self.model.eval()
 
-        self.outlines_model = outlines.from_transformers(self.model, self.tokenizer)
-        # Cache one Generator per schema class — outlines compiles a JSON-schema
-        # regex/FSM on construction. Compiling once at boot saves 0.5-1 s/turn.
-        self._generators: dict[type, object] = {}
-        log.info("model ready")
+        self._cache: dict[type, object] = {}
+        self._backend_name = self._init_backend()
+        log.info("model ready (constrainer=%s)", self._backend_name)
 
-    def _generator_for(self, target_schema: type):
-        gen = self._generators.get(target_schema)
-        if gen is None:
-            t = time.perf_counter()
-            gen = outlines.Generator(self.outlines_model, output_type=target_schema)
-            log.info("compiled outlines FSM for %s in %.2fs",
-                     target_schema.__name__, time.perf_counter() - t)
-            self._generators[target_schema] = gen
-        return gen
+    # ------------------------------------------------------------------
+    # backend selection
+    # ------------------------------------------------------------------
+
+    def _init_backend(self) -> str:
+        if BACKEND == "xgrammar":
+            try:
+                import xgrammar as xgr  # type: ignore
+                self._xgr = xgr
+                tok_info = xgr.TokenizerInfo.from_huggingface(
+                    self.tokenizer,
+                    vocab_size=self.model.config.vocab_size,
+                )
+                self._xgr_compiler = xgr.GrammarCompiler(tok_info)
+                return "xgrammar"
+            except Exception as e:
+                log.warning("xgrammar init failed (%s) — falling back to outlines", e)
+
+        # outlines fallback
+        import outlines  # type: ignore
+        self._outlines = outlines
+        self._outlines_model = outlines.from_transformers(self.model, self.tokenizer)
+        return "outlines"
+
+    # ------------------------------------------------------------------
+    # cached compile per Pydantic schema class
+    # ------------------------------------------------------------------
+
+    def _compile(self, target_schema: type):
+        cached = self._cache.get(target_schema)
+        if cached is not None:
+            return cached
+        t = time.perf_counter()
+        if self._backend_name == "xgrammar":
+            schema_str = json.dumps(target_schema.model_json_schema())
+            cached = self._xgr_compiler.compile_json_schema(schema_str)
+        else:
+            cached = self._outlines.Generator(self._outlines_model, output_type=target_schema)
+        log.info("compiled %s grammar for %s in %.2fs",
+                 self._backend_name, target_schema.__name__, time.perf_counter() - t)
+        self._cache[target_schema] = cached
+        return cached
+
+    # ------------------------------------------------------------------
+    # prompt + generate
+    # ------------------------------------------------------------------
 
     def _format_prompt(self, context_events: list[str]) -> str:
         joined = "\n".join(f"- {e}" for e in context_events)
@@ -95,45 +134,59 @@ class HybridRuntime:
         target_schema: type,
         max_new_tokens: int | None = None,
     ) -> object:
-        """Run constrained decode against `target_schema` (a Pydantic class).
-
-        Returns a parsed instance of `target_schema`. Caller picks the schema:
-          * UIStateManifest          — boot / USER_COMMAND replan
-          * UIPatch                  — post-SQL re-prompt, force tiny diff
-          * DatabaseAction           — click turn (SQL only)
-        """
         budget = max_new_tokens or MAX_NEW_TOKENS
         prompt = self._format_prompt(context_events)
+        compiled = self._compile(target_schema)
 
-        t_total = time.perf_counter()
-        generator = self._generator_for(target_schema)
+        t = time.perf_counter()
+        if self._backend_name == "xgrammar":
+            raw = self._generate_xgrammar(prompt, compiled, budget)
+        else:
+            raw = self._generate_outlines(prompt, compiled, budget)
+        decode_s = time.perf_counter() - t
 
-        t_decode = time.perf_counter()
-        raw = generator(prompt, max_new_tokens=budget)
-        decode_s = time.perf_counter() - t_decode
-        total_s = time.perf_counter() - t_total
         out_len = len(raw) if isinstance(raw, str) else -1
         log.info(
-            "GEN %s prompt_chars=%d out_chars=%d decode=%.2fs total=%.2fs",
-            target_schema.__name__, len(prompt), out_len, decode_s, total_s,
+            "GEN %s prompt_chars=%d out_chars=%d decode=%.2fs (%s)",
+            target_schema.__name__, len(prompt), out_len, decode_s, self._backend_name,
         )
-
         log.info("RAW_OUTPUT (target=%s, len=%d): %r",
-                 target_schema.__name__, len(raw) if isinstance(raw, str) else -1, raw)
+                 target_schema.__name__, out_len, raw)
 
-        if isinstance(raw, str):
-            # Outlines 1.x JSON FSM is relaxed (permits trailing commas the model
-            # learned from training data). json.loads is strict — clean first.
-            cleaned = _TRAILING_COMMA.sub(r"\1", raw)
-            try:
-                data = json.loads(cleaned)
-            except json.JSONDecodeError as e:
-                raise RuntimeError(
-                    f"Outlines produced invalid JSON (likely truncated at "
-                    f"MAX_NEW_TOKENS={MAX_NEW_TOKENS}). "
-                    f"Decoder error: {e}. Raw: {raw!r} | Cleaned: {cleaned!r}"
-                ) from e
-        else:
-            data = raw
+        cleaned = _TRAILING_COMMA.sub(r"\1", raw) if isinstance(raw, str) else raw
+        try:
+            data = json.loads(cleaned) if isinstance(cleaned, str) else cleaned
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"Constrainer produced invalid JSON. backend={self._backend_name} "
+                f"target={target_schema.__name__} err={e} raw={raw!r}"
+            ) from e
 
         return target_schema.model_validate(data)
+
+    # ------------------------------------------------------------------
+    # xgrammar inference path
+    # ------------------------------------------------------------------
+
+    def _generate_xgrammar(self, prompt: str, compiled_grammar, budget: int) -> str:
+        ids = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        from xgrammar.contrib.hf import LogitsProcessor as XgrLogitsProcessor  # type: ignore
+        proc = XgrLogitsProcessor(compiled_grammar)
+        with torch.no_grad():
+            out = self.model.generate(
+                **ids,
+                max_new_tokens=budget,
+                do_sample=False,
+                use_cache=True,
+                logits_processor=LogitsProcessorList([proc]),
+                pad_token_id=self.tokenizer.eos_token_id,
+            )
+        new_tokens = out[0, ids["input_ids"].shape[-1]:]
+        return self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+
+    # ------------------------------------------------------------------
+    # outlines fallback
+    # ------------------------------------------------------------------
+
+    def _generate_outlines(self, prompt: str, generator, budget: int) -> str:
+        return generator(prompt, max_new_tokens=budget)
