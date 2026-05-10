@@ -1,0 +1,14 @@
+torch
+transformers
+outlines
+psycopg2-binary
+fastapi
+uvicorn[standard]
+sqlalchemy
+pydantic
+accelerate
+sentencepiece
+websockets
+numpy
+# CUDA-only kernels — install separately via start_native.sh (will fail on macOS):
+#   pip install mamba-ssm causal-conv1d

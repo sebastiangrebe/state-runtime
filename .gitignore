@@ -1,0 +1,9 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.logs/
+canvas/node_modules/
+canvas/dist/
+canvas/.vite/
+.DS_Store

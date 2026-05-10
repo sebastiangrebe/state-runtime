@@ -1,0 +1,68 @@
+# State Runtime — single-container CUDA image (RunPod-ready).
+#
+# Includes Postgres + Python engine + prebuilt canvas. Exposes ONE port (8000)
+# that serves everything: WS, /health, and the static dashboard.
+#
+# Build (on a CUDA Linux host or via buildx for amd64):
+#   docker build -f Dockerfile.cuda -t state-runtime:cuda .
+#
+# Run locally with GPU:
+#   docker run --rm -it --gpus all -p 8000:8000 state-runtime:cuda
+#
+# Run on RunPod: see RUNPOD.md.
+
+FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0"
+ENV MAMBA_FORCE_BUILD=TRUE
+ENV CAUSAL_CONV1D_FORCE_BUILD=TRUE
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git curl ca-certificates gnupg \
+        python3.11 python3.11-venv python3.11-dev python3-pip \
+        build-essential ninja-build \
+        postgresql postgresql-contrib \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN ln -sf /usr/bin/python3.11 /usr/bin/python && \
+    python -m pip install --upgrade pip wheel setuptools
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu124
+
+COPY engine/requirements.txt /app/engine/requirements.txt
+RUN pip install --no-cache-dir -r /app/engine/requirements.txt
+
+# Mamba CUDA kernels — fail loudly here if the toolchain is broken.
+RUN pip install --no-cache-dir packaging && \
+    pip install --no-cache-dir --no-build-isolation \
+        causal-conv1d>=1.4.0 \
+        mamba-ssm>=2.2.0
+
+COPY engine /app/engine
+COPY canvas /app/canvas
+
+# Build the canvas. Engine will serve /app/canvas/dist as the root.
+WORKDIR /app/canvas
+RUN npm install && npm run build
+
+WORKDIR /app
+COPY scripts/entrypoint_cuda.sh /app/entrypoint_cuda.sh
+RUN chmod +x /app/entrypoint_cuda.sh
+
+# RunPod will tunnel this single port via its HTTPS proxy.
+EXPOSE 8000
+
+ENV PGDATA=/var/lib/postgresql/data
+ENV DATABASE_URL=postgresql+psycopg2://runtime:runtime@localhost:5432/runtime
+ENV MODEL_ID=ai21labs/AI21-Jamba2-3B
+ENV MAX_NEW_TOKENS=512
+ENV HF_HOME=/root/.cache/huggingface
+
+CMD ["/app/entrypoint_cuda.sh"]

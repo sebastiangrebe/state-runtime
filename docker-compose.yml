@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: state_runtime_pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: runtime
+      POSTGRES_PASSWORD: runtime
+      POSTGRES_DB: runtime
+    ports:
+      - "5432:5432"
+    volumes:
+      - state_runtime_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U runtime -d runtime"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  state_runtime_pgdata:
