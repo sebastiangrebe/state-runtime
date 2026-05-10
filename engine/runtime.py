@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import time
 
 import outlines
 import torch
@@ -110,7 +111,20 @@ class HybridRuntime:
         self.model.eval()
 
         self.outlines_model = outlines.from_transformers(self.model, self.tokenizer)
+        # Cache one Generator per schema class — outlines compiles a JSON-schema
+        # regex/FSM on construction. Compiling once at boot saves 0.5-1 s/turn.
+        self._generators: dict[type, object] = {}
         log.info("model ready")
+
+    def _generator_for(self, target_schema: type):
+        gen = self._generators.get(target_schema)
+        if gen is None:
+            t = time.perf_counter()
+            gen = outlines.Generator(self.outlines_model, output_type=target_schema)
+            log.info("compiled outlines FSM for %s in %.2fs",
+                     target_schema.__name__, time.perf_counter() - t)
+            self._generators[target_schema] = gen
+        return gen
 
     def _format_prompt(self, context_events: list[str]) -> str:
         joined = "\n".join(f"- {e}" for e in context_events)
@@ -124,18 +138,30 @@ class HybridRuntime:
         self,
         context_events: list[str],
         target_schema: type,
+        max_new_tokens: int | None = None,
     ) -> object:
         """Run constrained decode against `target_schema` (a Pydantic class).
 
         Returns a parsed instance of `target_schema`. Caller picks the schema:
           * UIStateManifest          — boot / USER_COMMAND replan
           * UIPatch                  — post-SQL re-prompt, force tiny diff
-          * EngineOutputEnvelope     — first hop on a click (model picks SQL or
-                                       direct patch)
+          * DatabaseAction           — click turn (SQL only)
         """
+        budget = max_new_tokens or MAX_NEW_TOKENS
         prompt = self._format_prompt(context_events)
-        generator = outlines.Generator(self.outlines_model, output_type=target_schema)
-        raw = generator(prompt, max_new_tokens=MAX_NEW_TOKENS)
+
+        t_total = time.perf_counter()
+        generator = self._generator_for(target_schema)
+
+        t_decode = time.perf_counter()
+        raw = generator(prompt, max_new_tokens=budget)
+        decode_s = time.perf_counter() - t_decode
+        total_s = time.perf_counter() - t_total
+        out_len = len(raw) if isinstance(raw, str) else -1
+        log.info(
+            "GEN %s prompt_chars=%d out_chars=%d decode=%.2fs total=%.2fs",
+            target_schema.__name__, len(prompt), out_len, decode_s, total_s,
+        )
 
         log.info("RAW_OUTPUT (target=%s, len=%d): %r",
                  target_schema.__name__, len(raw) if isinstance(raw, str) else -1, raw)

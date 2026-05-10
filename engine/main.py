@@ -47,6 +47,11 @@ async def lifespan(_: FastAPI):
     log.info("loading runtime (will crash if model fails to load)")
     runtime = HybridRuntime()
     generation_lock = asyncio.Lock()
+
+    # Warm the outlines FSM cache so the first click doesn't eat the compile.
+    for schema in (UIStateManifest, UIPatch, DatabaseAction):
+        runtime._generator_for(schema)
+
     log.info("ready device=%s", runtime.device)
     yield
 
@@ -100,9 +105,11 @@ async def ws_endpoint(ws: WebSocket) -> None:
             preview = preview[:600] + "…"
         log.info("TRACE turn=%d %s %s", turn_seq, phase, preview)
 
-    async def gen(target_schema: type) -> object:
+    async def gen(target_schema: type, max_new_tokens: int | None = None) -> object:
         async with generation_lock:
-            return await asyncio.to_thread(runtime.generate, context, target_schema)
+            return await asyncio.to_thread(
+                runtime.generate, context, target_schema, max_new_tokens
+            )
 
     async def emit_full(manifest: UIStateManifest) -> None:
         nonlocal current_manifest
@@ -165,7 +172,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
         # from a free union. Forcing the schema removes the choice.
         # (To allow direct patches on UI-only clicks, branch on user_action here.)
         await trace("MODEL_INPUT", {"target": "DatabaseAction (forced on click)", "events_tail": context[-12:]})
-        action = await gen(DatabaseAction)
+        action = await gen(DatabaseAction, max_new_tokens=96)
         await trace("MODEL_OUTPUT", action.model_dump())  # type: ignore[union-attr]
 
         await trace("SQL_INTERCEPT", {"sql": action.sql})  # type: ignore[union-attr]
@@ -177,7 +184,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
         context.append(f"DB_STATE: {json.dumps(new_state)}")
 
         await trace("MODEL_INPUT", {"target": "UIPatch (forced after SQL)", "events_tail": context[-12:]})
-        patch = await gen(UIPatch)
+        patch = await gen(UIPatch, max_new_tokens=128)
         await trace("MODEL_OUTPUT_FINAL", patch.model_dump())  # type: ignore[union-attr]
         await emit_patch(patch)  # type: ignore[arg-type]
 
