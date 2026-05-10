@@ -114,14 +114,24 @@ class HybridRuntime:
         t = time.perf_counter()
         if self._backend_name == "xgrammar":
             schema_str = json.dumps(target_schema.model_json_schema())
-            # any_whitespace=False forbids the indents / trailing newlines the
-            # model otherwise pads JSON with — cuts emitted tokens ~40-50%.
-            try:
-                cached = self._xgr_compiler.compile_json_schema(
-                    schema_str, any_whitespace=False
-                )
-            except TypeError:  # older xgrammar without the kwarg
-                cached = self._xgr_compiler.compile_json_schema(schema_str)
+            tight = False
+            for kwargs in (
+                {"any_whitespace": False, "strict_mode": True},
+                {"any_whitespace": False},
+                {"strict_mode": True},
+                {},
+            ):
+                try:
+                    cached = self._xgr_compiler.compile_json_schema(schema_str, **kwargs)
+                    tight = bool(kwargs)
+                    log.info("xgrammar.compile_json_schema accepted kwargs=%s", kwargs)
+                    break
+                except TypeError:
+                    continue
+            else:
+                raise RuntimeError("xgrammar.compile_json_schema rejected all kwargs")
+            if not tight:
+                log.warning("xgrammar grammar permits any whitespace — output will pad")
         else:
             cached = self._outlines.Generator(self._outlines_model, output_type=target_schema)
         log.info("compiled %s grammar for %s in %.2fs",
